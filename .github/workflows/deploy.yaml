@@ -1,0 +1,186 @@
+name: CloudFormation CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TEMPLATE_FILE: cloudformation/infrastructure.yaml
+  PARAMETERS_FILE: cloudformation/parameters.json
+  TAGS_FILE: cloudformation/tags.json
+
+jobs:
+  lint-and-validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install cfn-lint
+        run: pip install cfn-lint
+
+      - name: Run cfn-lint
+        run: |
+          cfn-lint ${{ env.TEMPLATE_FILE }} --include-checks W
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Validate-${{ github.run_id }}
+
+      - name: Validate template against AWS
+        run: |
+          aws cloudformation validate-template \
+            --template-body file://${{ env.TEMPLATE_FILE }}
+
+  upload-template:
+    needs: lint-and-validate
+    runs-on: ubuntu-latest
+
+    outputs:
+      template-url: ${{ steps.upload.outputs.template-url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload template
+        id: upload
+        run: |
+          TEMPLATE_KEY=templates/${{ github.run_id }}/infrastructure.yaml
+
+          aws s3 cp \
+            ${{ env.TEMPLATE_FILE }} \
+            s3://${{ vars.CFN_BUCKET }}/$TEMPLATE_KEY
+
+          echo "template-url=https://${{ vars.CFN_BUCKET }}.s3.${{ env.AWS_REGION }}.amazonaws.com/$TEMPLATE_KEY" >> "$GITHUB_OUTPUT"
+      
+
+  create-change-set:
+    needs: upload-template
+    runs-on: ubuntu-latest
+
+    outputs:
+      change-set-name: ${{ steps.change-set.outputs.change-set-name }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create Change Set
+        id: change-set
+        run: |
+          STACK_NAME=cfn-demo-stack
+          CHANGE_SET_NAME=changeset-${{ github.run_id }}
+
+          if aws cloudformation describe-stacks --stack-name $STACK_NAME >/dev/null 2>&1; then
+            CHANGE_SET_TYPE=UPDATE
+          else
+            CHANGE_SET_TYPE=CREATE
+          fi
+
+          aws cloudformation create-change-set \
+            --stack-name $STACK_NAME \
+            --change-set-name $CHANGE_SET_NAME \
+            --change-set-type $CHANGE_SET_TYPE \
+            --template-url "${{ needs.upload-template.outputs.template-url }}" \
+            --parameters file://${{ env.PARAMETERS_FILE }} \
+            --tags file://${{ env.TAGS_FILE }} \
+            --capabilities CAPABILITY_NAMED_IAM
+
+          aws cloudformation wait change-set-create-complete \
+            --stack-name $STACK_NAME \
+            --change-set-name $CHANGE_SET_NAME || true
+
+          STATUS=$(aws cloudformation describe-change-set \
+            --stack-name $STACK_NAME \
+            --change-set-name $CHANGE_SET_NAME \
+            --query Status \
+            --output text)
+
+          if [ "$STATUS" != "CREATE_COMPLETE" ]; then
+            REASON=$(aws cloudformation describe-change-set \
+              --stack-name $STACK_NAME \
+              --change-set-name $CHANGE_SET_NAME \
+              --query StatusReason \
+              --output text)
+
+            if [[ "$REASON" == *"didn't contain changes"* ]]; then
+              echo "No changes detected."
+            else
+              echo "$REASON"
+              exit 1
+            fi
+          fi
+
+          echo "change-set-name=$CHANGE_SET_NAME" >> "$GITHUB_OUTPUT"
+
+
+  deploy:
+    needs: create-change-set
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Execute Change Set
+        run: |
+          STACK_NAME=cfn-demo-stack
+
+          aws cloudformation execute-change-set \
+            --stack-name $STACK_NAME \
+            --change-set-name "${{ needs.create-change-set.outputs.change-set-name }}"
+
+          aws cloudformation wait stack-update-complete \
+            --stack-name $STACK_NAME || \
+          aws cloudformation wait stack-create-complete \
+            --stack-name $STACK_NAME
+
+  verify:
+    needs: deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify deployment
+        run: |
+          STACK_NAME=cfn-demo-stack
+
+          aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME
+
+          aws lambda get-function \
+            --function-name cfn-demo-dev-handler
+
+          echo "Deployment verified successfully!"
