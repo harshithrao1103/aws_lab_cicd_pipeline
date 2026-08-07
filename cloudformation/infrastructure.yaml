@@ -4,7 +4,7 @@ Description: >
   Demo infrastructure stack containing a Lambda function.
   Managed by GitHub Actions CI/CD pipeline.
 
-  Parameters:
+Parameters:
   Environment:
     Type: String
     Default: dev
